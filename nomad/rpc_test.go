@@ -10,11 +10,15 @@ import (
 
 	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
 	"github.com/hashicorp/nomad/helper/pool"
+	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/hashicorp/raft"
+	"github.com/hashicorp/yamux"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // rpcClient is a test helper method to return a ClientCodec to use to make rpc
@@ -171,4 +175,90 @@ func TestRPC_PlaintextRPCFailsWhenNotInUpgradeMode(t *testing.T) {
 	var resp structs.GenericResponse
 	err := msgpackrpc.CallWithCodec(codec, "Node.Register", req, &resp)
 	assert.NotNil(err)
+}
+
+func TestRPC_streamingRpcConn_badMethod(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+
+	s1 := TestServer(t, nil)
+	defer s1.Shutdown()
+	s2 := TestServer(t, func(c *Config) {
+		c.DevDisableBootstrap = true
+	})
+	defer s2.Shutdown()
+	TestJoin(t, s1, s2)
+	testutil.WaitForLeader(t, s1.RPC)
+	testutil.WaitForLeader(t, s2.RPC)
+
+	s1.peerLock.RLock()
+	ok, parts := isNomadServer(s2.LocalMember())
+	require.True(ok)
+	server := s1.localPeers[raft.ServerAddress(parts.Addr.String())]
+	require.NotNil(server)
+	s1.peerLock.RUnlock()
+
+	conn, err := s1.streamingRpc(server, "Bogus")
+	require.Nil(conn)
+	require.NotNil(err)
+	require.Contains(err.Error(), "unknown rpc method: \"Bogus\"")
+}
+
+// COMPAT: Remove in 0.10
+// This is a very low level test to assert that the V2 handling works. It is
+// making manual RPC calls since no helpers exist at this point since we are
+// only implementing support for v2 but not using it yet. In the future we can
+// switch the conn pool to establishing v2 connections and we can deprecate this
+// test.
+func TestRPC_handleMultiplexV2(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	s := TestServer(t, nil)
+	defer s.Shutdown()
+	testutil.WaitForLeader(t, s.RPC)
+
+	p1, p2 := net.Pipe()
+	defer p1.Close()
+	defer p2.Close()
+
+	// Start the handler
+	doneCh := make(chan struct{})
+	go func() {
+		s.handleConn(p2, &RPCContext{Conn: p2})
+		close(doneCh)
+	}()
+
+	// Establish the MultiplexV2 connection
+	_, err := p1.Write([]byte{byte(pool.RpcMultiplexV2)})
+	require.Nil(err)
+
+	// Make two streams
+	conf := yamux.DefaultConfig()
+	conf.LogOutput = testlog.NewWriter(t)
+	session, err := yamux.Client(p1, conf)
+	require.Nil(err)
+
+	s1, err := session.Open()
+	require.Nil(err)
+	defer s1.Close()
+
+	s2, err := session.Open()
+	require.Nil(err)
+	defer s2.Close()
+
+	// Make an RPC
+	_, err = s1.Write([]byte{byte(pool.RpcNomad)})
+	require.Nil(err)
+
+	args := &structs.GenericRequest{}
+	var l string
+	err = msgpackrpc.CallWithCodec(pool.NewClientCodec(s1), "Status.Leader", args, &l)
+	require.Nil(err)
+	require.NotEmpty(l)
+
+	// Make a streaming RPC
+	err = s.streamingRpcImpl(s2, "Bogus")
+	require.NotNil(err)
+	require.Contains(err.Error(), "unknown rpc")
+
 }

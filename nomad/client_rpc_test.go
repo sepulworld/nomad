@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/hashicorp/nomad/client"
+	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
@@ -248,4 +250,33 @@ func TestServerWithNodeConn_NoPathAndErr(t *testing.T) {
 	require.Nil(srv)
 	require.NotNil(err)
 	require.Contains(err.Error(), "failed querying")
+}
+
+func TestNodeStreamingRpc_badEndpoint(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	s1 := TestServer(t, nil)
+	defer s1.Shutdown()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	c := client.TestClient(t, func(c *config.Config) {
+		c.Servers = []string{s1.config.RPCAddr.String()}
+	})
+	defer c.Shutdown()
+
+	// Wait for the client to connect
+	testutil.WaitForResult(func() (bool, error) {
+		nodes := s1.connectedNodes()
+		return len(nodes) == 1, nil
+	}, func(err error) {
+		t.Fatalf("should have a clients")
+	})
+
+	state, ok := s1.getNodeConn(c.NodeID())
+	require.True(ok)
+
+	conn, err := NodeStreamingRpc(state.Session, "Bogus")
+	require.Nil(conn)
+	require.NotNil(err)
+	require.Contains(err.Error(), "unknown rpc method: \"Bogus\"")
 }
